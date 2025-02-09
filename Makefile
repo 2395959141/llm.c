@@ -16,6 +16,8 @@ FORCE_NVCC_O ?= 3
 
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
+
+#NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O)
 NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O)
 NVCC_LDFLAGS = -lcublas -lcublasLt
 NVCC_INCLUDES =
@@ -288,3 +290,7 @@ profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 clean:
 	$(REMOVE_FILES) $(TARGETS)
 	$(REMOVE_BUILD_OBJECT_FILES)
+
+debug: CFLAGS = -g -Wall
+debug: NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -g
+debug: all
