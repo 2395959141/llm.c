@@ -33,7 +33,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // ----------- GPU utilities -----------
 // defines:
 // WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV, cudaCheck, PRECISION_MODE
-// NVTX_RANGE_FN
+//NVTX_RANGE_FN
 #include "llmc/cuda_common.h"
 // defines:
 // Packed128, f128, x128
@@ -113,6 +113,7 @@ typedef struct {
     floatX* lnfw; // (C)
     floatX* lnfb; // (C)
 } ParameterTensors;
+// * sizeof(void*) 是获取指针类型的大小，64位系统里是8字节
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
@@ -138,6 +139,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[15] = C; // lnfb
 
     // populate the parameter sizes in bytes (all the same for now, keeping for future use)
+    // * 遍历每个张量，将其设置为__nv_bfloat16的大小
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         param_sizeof[i] = sizeof(floatX);
     }
@@ -167,33 +169,37 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     return params_memory;
 }
 
+// * 定义激活的张量
 constexpr int NUM_ACTIVATION_TENSORS = 21;
 typedef struct {
-    floatX* encoded; // (B, T, C)
-    floatX* ln1; // (L, B, T, C)
-    float* ln1_mean; // (L, B, T)
-    float* ln1_rstd; // (L, B, T)
-    floatX* atty; // (L, B, T, C)
+    floatX* encoded; // (B, T, C) //* 输入的 token 通过词嵌入（wte）和位置嵌入（wpe）进行编码。
+    floatX* ln1; // (L, B, T, C) //* 对 encoded 进行 LayerNorm 操作
+    float* ln1_mean; // (L, B, T) //* 存储 LayerNorm 的均值
+    float* ln1_rstd; // (L, B, T) //* 存储 LayerNorm 的标准差
+    floatX* atty; // (L, B, T, C) //* 存储注意力权重 
+                                    // * qkvr = matmul(ln1, qkvw) + qkvb
+                                    // *    atty = Attention(qkvr)
     // cuDNN saves only some statistics information
 #if ENABLE_CUDNN
-    float* att;  // (L, B, NH, T)
+    float* att;  // (L, B, NH, T) //* 如果启用 cuDNN，att 存储注意力权重的统计信息
 #else
-    floatX* att; // (L, B, NH, T, T)
+    floatX* att; // (L, B, NH, T, T) //* 如果未启用 cuDNN，att 存储完整的注意力权重矩阵
 #endif
 
-    floatX* residual2; // (L, B, T, C)
-    floatX* ln2; // (L, B, T, C)
+    floatX* residual2; // (L, B, T, C) //* 将注意力输出和全连接层输出与输入进行残差连接
+    floatX* ln2; // (L, B, T, C)    //* 对注意力输出 atty 进行 LayerNorm 操作。
     float* ln2_mean; // (L, B, T)
     float* ln2_rstd; // (L, B, T)
-    floatX* fch; // (L, B, T, 4*C)
+    floatX* fch; // (L, B, T, 4*C)  // * 通过全连接层和 GELU 激活函数计算输出。
     floatX* fch_gelu; // (L, B, T, 4*C)
-    floatX* residual3; // (L, B, T, C)
+    floatX* residual3; // (L, B, T, C) //* 将全连接层输出与输入进行残差连接
     floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
-    float* lnf_mean; // (B, T)
-    float* lnf_rstd; // (B, T)
-    float* losses; // (B, T), will be accumulated in micro-steps
+                 // * 最终归一化的输出
+    float* lnf_mean; // (B, T) //* 存储 LayerNorm 的均值    
+    float* lnf_rstd; // (B, T) //* 存储 LayerNorm 的标准差
+    float* losses; // (B, T), will be accumulated in micro-steps //* 存储损失值
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
-    floatX* qkvr; // (L, B, T, 3*C)
+    floatX* qkvr; // (L, B, T, 3*C) //* 存储注意力权重矩阵
     // in inference mode, this buffer will store the logits
     // in training mode, this buffer will contain the *gradients* of the logits.
     // during the processing of transformer blocks, we will also use this as a
@@ -202,8 +208,8 @@ typedef struct {
     floatX* output;
 
     // some additional scratch buffers
-    floatX* scratch_bt4c;   // (B, T, 4*C)
-    floatX* scratch_btc;    // (B, T, C)
+    floatX* scratch_bt4c;   // (B, T, 4*C) //* 存储全连接相关的结果，FN 的隐藏层大小通常是输入大小的 4 倍（即 4*C
+    floatX* scratch_btc;    // (B, T, C) //* 它通常用于存储与残差连接、LayerNorm 或其他较小规模的中间计算相关的临时结果。
 } ActivationTensors;
 
 
@@ -213,7 +219,7 @@ struct TensorSpec {
     DType type;
 };
 
-
+// * 定义张量规格
 #define TENSOR_SPEC(pointer, size) TensorSpec{(void**)(&pointer), (size), dtype_of(pointer)};
 
 void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t B, size_t T, GPT2Config config, int recompute) {
@@ -241,7 +247,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
     tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
-    tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
+    tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);                 
     tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
     tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
